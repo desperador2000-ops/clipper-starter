@@ -1,60 +1,70 @@
+import formidable from "formidable";
 import fs from "fs";
-import os from "os";
-import path from "path";
 import s3 from "../../lib/s3";
-import prisma from "../../lib/prisma";
-import { cutClip } from "../../utils/ffmpeg";
+import { requireAuth } from "../../lib/auth";
+
+export const config = {
+  api: {
+    bodyParser: false,
+  },
+};
+
+const MAX_FILE_SIZE = 300 * 1024 * 1024; // 300MB
+const ALLOWED_MIME_PREFIXES = ["video/", "audio/"];
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    if (req.method === "GET") {
-      const clips = await prisma.clip.findMany({ orderBy: { createdAt: "desc" } });
-      return res.json(clips);
-    }
-    return res.status(405).end();
-  }
+  const session = await requireAuth(req, res);
+  if (!session) return;
 
-  const { sourceKey, start = 0, end, title } = req.body;
-  if (!sourceKey || typeof end === "undefined") return res.status(400).json({ error: "sourceKey and end required" });
+  if (req.method !== "POST") return res.status(405).end();
 
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "clipper-"));
-  const sourcePath = path.join(tmpDir, path.basename(sourceKey));
-  const outKey = `clips/${Date.now()}-${path.basename(sourceKey)}`;
-  const outPath = path.join(tmpDir, "out-" + path.basename(sourceKey));
-
-  try {
-    // Download source from S3
-    const obj = await s3.getObject({ Bucket: process.env.S3_BUCKET, Key: sourceKey }).promise();
-    fs.writeFileSync(sourcePath, obj.Body);
-
-    const duration = Math.max(0, Math.floor(end - start));
-    await cutClip({ inputPath: sourcePath, start, duration, outputPath: outPath });
-
-    const body = fs.readFileSync(outPath);
-    await s3.putObject({
-      Bucket: process.env.S3_BUCKET,
-      Key: outKey,
-      Body: body,
-      ContentType: "video/mp4"
-    }).promise();
-
-    const clip = await prisma.clip.create({
-      data: {
-        title,
-        sourceKey,
-        clipKey: outKey,
-        start: Math.floor(start),
-        end: Math.floor(end),
-        duration
+  const form = formidable({
+    multiples: false,
+    maxFileSize: MAX_FILE_SIZE,
+    filter: (part) => {
+      if (part.name === 'file') {
+        const mime = part.mimetype || '';
+        return ALLOWED_MIME_PREFIXES.some((prefix) => mime.startsWith(prefix));
       }
-    });
+      return true;
+    }
+  });
 
-    // cleanup
-    fs.unlinkSync(sourcePath);
-    fs.unlinkSync(outPath);
-    res.json(clip);
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message });
-  }
+  form.parse(req, async (err, fields, files) => {
+    if (err) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json({ error: 'Fichier trop volumineux (max 300MB)' });
+      }
+      return res.status(400).json({ error: err.message || 'Erreur upload' });
+    }
+
+    const file = files.file;
+    if (!file) {
+      return res.status(400).json({ error: 'Aucun fichier fourni' });
+    }
+
+    const mime = file.mimetype || '';
+    const isAllowed = ALLOWED_MIME_PREFIXES.some((prefix) => mime.startsWith(prefix));
+    if (!isAllowed) {
+      return res.status(415).json({ error: 'Type de fichier non autorisé. Utilise uniquement video/* ou audio/*' });
+    }
+
+    const data = fs.readFileSync(file.filepath);
+    const key = `sources/${Date.now()}-${String(file.originalFilename || 'upload').replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+
+    try {
+      await s3.putObject({
+        Bucket: process.env.S3_BUCKET,
+        Key: key,
+        Body: data,
+        ContentType: file.mimetype,
+      }).promise();
+
+      const url = `${process.env.S3_ENDPOINT}/${process.env.S3_BUCKET}/${key}`;
+      res.json({ key, url });
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: e.message });
+    }
+  });
 }

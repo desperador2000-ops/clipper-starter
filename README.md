@@ -1,35 +1,77 @@
-# Clipper - starter
+import fs from "fs";
+import os from "os";
+import path from "path";
+import s3 from "../../lib/s3";
+import prisma from "../../lib/prisma";
+import { cutClip } from "../../utils/ffmpeg";
+import { requireAuth } from "../../lib/auth";
 
-MVP Clipping (Next.js + Prisma + ffmpeg + S3/MinIO)
+export default async function handler(req, res) {
+  const session = await requireAuth(req, res);
+  if (!session) return;
 
-Prereqs:
-- Docker & Docker Compose
-- Node 18+
-- (option) ffmpeg system-wide; ffmpeg-static is included but having ffmpeg helps.
+  if (req.method === "GET") {
+    const clips = await prisma.clip.findMany({ orderBy: { createdAt: "desc" } });
+    return res.json(clips);
+  }
 
-1) Démarrer infra dev (Postgres + MinIO)
+  if (req.method !== "POST") {
+    return res.status(405).end();
+  }
 
-docker-compose up -d
+  const { sourceKey, start = 0, end, title } = req.body;
+  if (!sourceKey || typeof end === "undefined") {
+    return res.status(400).json({ error: "sourceKey and end required" });
+  }
 
-2) Copier `.env.example` en `.env` et remplir les valeurs (voir MinIO credentials dans docker-compose)
+  const startNum = Number(start);
+  const endNum = Number(end);
 
-3) Installer
+  if (!Number.isFinite(startNum) || !Number.isFinite(endNum) || endNum <= startNum) {
+    return res.status(400).json({ error: "start/end invalid" });
+  }
 
-npm install
+  const owner = await prisma.user.findUnique({
+    where: { email: session.user.email }
+  });
 
-4) Initialiser la DB (Prisma)
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "clipper-"));
+  const sourcePath = path.join(tmpDir, path.basename(sourceKey));
+  const outKey = `clips/${Date.now()}-${path.basename(sourceKey)}`;
+  const outPath = path.join(tmpDir, "out-" + path.basename(sourceKey));
 
-npx prisma generate
-npx prisma migrate dev --name init
+  try {
+    const obj = await s3.getObject({ Bucket: process.env.S3_BUCKET, Key: sourceKey }).promise();
+    fs.writeFileSync(sourcePath, obj.Body);
 
-5) Lancer en dev
+    const duration = Math.max(0, Math.floor(endNum - startNum));
+    await cutClip({ inputPath: sourcePath, start: startNum, duration, outputPath: outPath });
 
-npm run dev
+    const body = fs.readFileSync(outPath);
+    await s3.putObject({
+      Bucket: process.env.S3_BUCKET,
+      Key: outKey,
+      Body: body,
+      ContentType: "video/mp4"
+    }).promise();
 
-Endpoints principaux:
-- POST /api/upload -> upload multipart => renvoie { key, url }
-- POST /api/clips -> { sourceKey, start, end, title } -> découpe via ffmpeg -> renvoie clip DB object
+    const clip = await prisma.clip.create({
+      data: {
+        title: title || "Clip",
+        sourceKey,
+        clipKey: outKey,
+        start: Math.floor(startNum),
+        end: Math.floor(endNum),
+        duration,
+        ownerId: owner ? owner.id : null
+      }
+    });
 
-Notes:
-- Pour la production, configure un bucket S3 réel et secrets (ne pas utiliser MinIO en prod).
-- ffmpeg est utilisé via ffmpeg-static; si tu veux isolation, tu peux exécuter le service ffmpeg dans un conteneur.
+    fs.unlinkSync(sourcePath);
+    fs.unlinkSync(outPath);
+    res.json(clip);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+}
