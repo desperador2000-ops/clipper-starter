@@ -59,10 +59,11 @@ model Clip {
   ownerId     String?
   title       String?
   sourceKey   String
-  clipKey     String
+  clipKey     String?
   start       Int
   end         Int
-  duration    Int
+  duration    Int?
+  status      String   @default("queued")
   createdAt   DateTime @default(now())
   owner       User?    @relation(fields: [ownerId], references: [id])
 }

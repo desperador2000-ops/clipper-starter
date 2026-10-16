@@ -1,70 +1,58 @@
-import formidable from "formidable";
-import fs from "fs";
 import s3 from "../../lib/s3";
+import prisma from "../../lib/prisma";
 import { requireAuth } from "../../lib/auth";
-
-export const config = {
-  api: {
-    bodyParser: false,
-  },
-};
-
-const MAX_FILE_SIZE = 300 * 1024 * 1024; // 300MB
-const ALLOWED_MIME_PREFIXES = ["video/", "audio/"];
+import queue from "../../lib/queue";
 
 export default async function handler(req, res) {
   const session = await requireAuth(req, res);
   if (!session) return;
 
-  if (req.method !== "POST") return res.status(405).end();
+  if (req.method === "GET") {
+    const clips = await prisma.clip.findMany({ orderBy: { createdAt: "desc" } });
+    return res.json(clips);
+  }
 
-  const form = formidable({
-    multiples: false,
-    maxFileSize: MAX_FILE_SIZE,
-    filter: (part) => {
-      if (part.name === 'file') {
-        const mime = part.mimetype || '';
-        return ALLOWED_MIME_PREFIXES.some((prefix) => mime.startsWith(prefix));
+  if (req.method !== "POST") {
+    return res.status(405).end();
+  }
+
+  const { sourceKey, start = 0, end, title } = req.body;
+  if (!sourceKey || typeof end === "undefined") {
+    return res.status(400).json({ error: "sourceKey and end required" });
+  }
+
+  const startNum = Number(start);
+  const endNum = Number(end);
+  if (!Number.isFinite(startNum) || !Number.isFinite(endNum) || endNum <= startNum) {
+    return res.status(400).json({ error: "start/end invalid" });
+  }
+
+  const owner = await prisma.user.findUnique({ where: { email: session.user.email } });
+
+  try {
+    const clip = await prisma.clip.create({
+      data: {
+        title: title || "Clip",
+        sourceKey,
+        start: Math.floor(startNum),
+        end: Math.floor(endNum),
+        duration: null,
+        ownerId: owner ? owner.id : null,
+        status: 'queued'
       }
-      return true;
-    }
-  });
+    });
 
-  form.parse(req, async (err, fields, files) => {
-    if (err) {
-      if (err.code === 'LIMIT_FILE_SIZE') {
-        return res.status(413).json({ error: 'Fichier trop volumineux (max 300MB)' });
-      }
-      return res.status(400).json({ error: err.message || 'Erreur upload' });
-    }
+    const job = await queue.add('process', {
+      clipId: clip.id,
+      sourceKey,
+      start: startNum,
+      end: endNum,
+      title: title || 'Clip'
+    });
 
-    const file = files.file;
-    if (!file) {
-      return res.status(400).json({ error: 'Aucun fichier fourni' });
-    }
-
-    const mime = file.mimetype || '';
-    const isAllowed = ALLOWED_MIME_PREFIXES.some((prefix) => mime.startsWith(prefix));
-    if (!isAllowed) {
-      return res.status(415).json({ error: 'Type de fichier non autorisé. Utilise uniquement video/* ou audio/*' });
-    }
-
-    const data = fs.readFileSync(file.filepath);
-    const key = `sources/${Date.now()}-${String(file.originalFilename || 'upload').replace(/[^a-zA-Z0-9._-]/g, '_')}`;
-
-    try {
-      await s3.putObject({
-        Bucket: process.env.S3_BUCKET,
-        Key: key,
-        Body: data,
-        ContentType: file.mimetype,
-      }).promise();
-
-      const url = `${process.env.S3_ENDPOINT}/${process.env.S3_BUCKET}/${key}`;
-      res.json({ key, url });
-    } catch (e) {
-      console.error(e);
-      res.status(500).json({ error: e.message });
-    }
-  });
+    res.json({ clip, jobId: job.id });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
 }
