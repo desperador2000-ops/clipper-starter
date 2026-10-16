@@ -53,6 +53,9 @@ const worker = new Worker('clip-processing', async (job) => {
   const outPath = path.join(tmpDir, 'out-' + path.basename(sourceKey));
 
   try {
+    // mark processing
+    await prisma.clip.update({ where: { id: clipId }, data: { status: 'processing' } });
+
     // download source
     const obj = await s3.getObject({ Bucket: process.env.S3_BUCKET, Key: sourceKey }).promise();
     fs.writeFileSync(sourcePath, obj.Body);

@@ -23,7 +23,8 @@
     "next-auth": "^4.22.1",
     "@next-auth/prisma-adapter": "^1.0.5",
     "bullmq": "^1.79.0",
-    "ioredis": "^5.3.2"
+    "ioredis": "^5.3.2",
+    "wavesurfer.js": "^6.2.0"
   },
   "devDependencies": {
     "prisma": "^5.12.0",
