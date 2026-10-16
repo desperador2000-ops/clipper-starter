@@ -1,20 +1,23 @@
 import { getServerSession } from 'next-auth';
 import { authOptions } from '../../pages/api/auth/[...nextauth]';
-import s3 from '../../../lib/s3';
-import prisma from '../../../lib/prisma';
-import { requireAuth } from '../../../lib/auth';
+import s3 from '../../lib/s3';
+import prisma from '../../lib/prisma';
+import { requireAuth } from '../../lib/auth';
 
 function getObjectUrl(key) {
   if (!key) return null;
-  if (process.env.S3_ENDPOINT) {
-    // MinIO or custom endpoint
-    return `${process.env.S3_ENDPOINT.replace(/\/$/, '')}/${process.env.S3_BUCKET}/${key}`;
-  }
-  // fallback to presigned URL using AWS SDK
+  const expires = Number(process.env.PRESIGNED_EXPIRES || 3600);
   try {
-    const url = s3.getSignedUrl('getObject', { Bucket: process.env.S3_BUCKET, Key: key, Expires: 60 * 60 });
+    // If using custom endpoint (MinIO), construct direct URL; for AWS S3, generate presigned URL
+    if (process.env.S3_ENDPOINT && process.env.S3_FORCE_PATH_STYLE === 'true') {
+      // For MinIO/dev return a directly accessible URL (bucket path)
+      return `${process.env.S3_ENDPOINT.replace(/\/$/, '')}/${process.env.S3_BUCKET}/${key}`;
+    }
+    // AWS S3 presigned
+    const url = s3.getSignedUrl('getObject', { Bucket: process.env.S3_BUCKET, Key: key, Expires: expires });
     return url;
   } catch (e) {
+    console.error('getObjectUrl error', e);
     return null;
   }
 }
@@ -56,8 +59,6 @@ export default async function handler(req, res) {
           console.error('Failed to delete clip object', e);
         }
       }
-
-      // optionally delete source too? we keep source for traceability
 
       await prisma.clip.delete({ where: { id } });
       return res.json({ success: true });

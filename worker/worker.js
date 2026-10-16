@@ -8,9 +8,8 @@ const { spawn } = require('child_process');
 const ffmpegPath = require('ffmpeg-static');
 const { PrismaClient } = require('@prisma/client');
 
-const redisConnection = process.env.REDIS_URL
-  ? { connection: { url: process.env.REDIS_URL } }
-  : { connection: { host: process.env.REDIS_HOST || 'localhost', port: Number(process.env.REDIS_PORT || 6379) } };
+const redisUrl = process.env.REDIS_URL || `redis://${process.env.REDIS_HOST || 'localhost'}:${process.env.REDIS_PORT || 6379}`;
+const redisConnection = { connection: { url: redisUrl } };
 
 const s3 = new AWS.S3({
   endpoint: process.env.S3_ENDPOINT,
@@ -21,18 +20,26 @@ const s3 = new AWS.S3({
 });
 
 const prisma = new PrismaClient();
+const pub = new IORedis(redisUrl);
 
 function cutClip(inputPath, start, duration, outputPath) {
   return new Promise((resolve, reject) => {
+    // Re-encode to H.264/AAC for compatibility
     const args = [
       '-y',
       '-i', inputPath,
       '-ss', String(start),
       '-t', String(duration),
-      '-c', 'copy',
+      '-c:v', 'libx264',
+      '-preset', 'medium',
+      '-crf', '23',
+      '-c:a', 'aac',
+      '-b:a', '128k',
       outputPath
     ];
     const proc = spawn(ffmpegPath, args);
+    proc.stdout && proc.stdout.on('data', (d) => console.log(d.toString()));
+    proc.stderr && proc.stderr.on('data', (d) => console.error(d.toString()));
     proc.on('close', (code) => {
       if (code === 0 && fs.existsSync(outputPath)) {
         resolve(outputPath);
@@ -49,12 +56,13 @@ const worker = new Worker('clip-processing', async (job) => {
   const { clipId, sourceKey, start, end, title } = job.data;
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clipper-'));
   const sourcePath = path.join(tmpDir, path.basename(sourceKey));
-  const outKey = `clips/${Date.now()}-${path.basename(sourceKey)}`;
-  const outPath = path.join(tmpDir, 'out-' + path.basename(sourceKey));
+  const outKey = `clips/${Date.now()}-${path.basename(sourceKey).replace(/[^a-zA-Z0-9._-]/g,'_')}.mp4`;
+  const outPath = path.join(tmpDir, 'out-' + path.basename(sourceKey) + '.mp4');
 
   try {
     // mark processing
     await prisma.clip.update({ where: { id: clipId }, data: { status: 'processing' } });
+    await pub.publish('clip_updates', JSON.stringify({ id: clipId, status: 'processing' }));
 
     // download source
     const obj = await s3.getObject({ Bucket: process.env.S3_BUCKET, Key: sourceKey }).promise();
@@ -80,6 +88,8 @@ const worker = new Worker('clip-processing', async (job) => {
       }
     });
 
+    await pub.publish('clip_updates', JSON.stringify({ id: clipId, status: 'done' }));
+
     fs.unlinkSync(sourcePath);
     fs.unlinkSync(outPath);
 
@@ -89,6 +99,7 @@ const worker = new Worker('clip-processing', async (job) => {
     console.error('Job failed', job.id, err);
     try {
       await prisma.clip.update({ where: { id: clipId }, data: { status: 'failed' } });
+      await pub.publish('clip_updates', JSON.stringify({ id: clipId, status: 'failed', error: err.message }));
     } catch (e) {
       console.error('Failed to update clip status after error', e);
     }
